@@ -2,6 +2,9 @@
 // touches Node directly; everything that spawns processes or touches the
 // filesystem goes through these calls.
 
+import type { KubeconfigInfo } from './kubeconfig'
+export type { KubeconfigInfo }
+
 export interface CommandResult {
   status: number
   stdout: string
@@ -98,6 +101,11 @@ export interface StudioAPI {
   updateTray(summary: TraySummary): void
   /** Writes a kubeconfig that only sets current-context; returns a KUBECONFIG value. */
   kubeconfigFor(context: string): Promise<string>
+  /** Points every ax and kubectl call at these kubeconfig file(s); '' restores the launch default. */
+  setKubeconfig(value: string): Promise<KubeconfigInfo>
+  kubeconfigInfo(): Promise<KubeconfigInfo>
+  /** A file dialog for one or more kubeconfig files; returns a KUBECONFIG value or null if cancelled. */
+  pickKubeconfig(current: string): Promise<string | null>
   fileExists(path: string): Promise<boolean>
   containerRuntime(): Promise<ContainerRuntime>
   openYAML(defaultDir?: string): Promise<{ path: string; text: string } | null>

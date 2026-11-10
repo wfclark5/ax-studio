@@ -1,9 +1,10 @@
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
 import { existsSync, mkdirSync, writeFileSync, chmodSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { delimiter, join } from 'node:path'
+import { delimiter, join, sep } from 'node:path'
 import DOCKER_SHIM from './docker-shim.sh?raw'
 import type { CommandResult, ContainerRuntime, PipeRequest, RunRequest, SessionRequest, StreamRequest } from '../shared/api'
+import { effectiveKubeconfig, expandHome, splitKubeconfig, type KubeconfigInfo } from '../shared/kubeconfig'
 
 const isWin = process.platform === 'win32'
 
@@ -35,6 +36,35 @@ const extra = isWin
 const PATH = [...new Set([...loginPath().split(delimiter), ...extra].filter(Boolean))].join(delimiter)
 
 export const env: NodeJS.ProcessEnv = { ...process.env, PATH }
+
+/** KUBECONFIG as the app was launched: a launcher script may have set it. */
+const inheritedKubeconfig = process.env.KUBECONFIG ?? ''
+/** The kubeconfig picked in Settings; '' falls back to the inherited value, then ~/.kube/config. */
+let chosenKubeconfig = ''
+
+/**
+ * Points every spawned ax, kubectl and shell step at the given kubeconfig
+ * file(s). The user's own kubeconfig and global context stay untouched.
+ */
+export function setKubeconfig(value: string): KubeconfigInfo {
+  chosenKubeconfig = value.trim()
+  const chosen = splitKubeconfig(chosenKubeconfig, delimiter).map((p) => expandHome(p, home, sep)).join(delimiter)
+  if (chosen) env.KUBECONFIG = chosen
+  else if (inheritedKubeconfig) env.KUBECONFIG = inheritedKubeconfig
+  else delete env.KUBECONFIG
+  return kubeconfigInfo()
+}
+
+export function kubeconfigInfo(): KubeconfigInfo {
+  const effective = effectiveKubeconfig(chosenKubeconfig, inheritedKubeconfig, home, delimiter, sep)
+  return {
+    chosen: chosenKubeconfig,
+    inherited: inheritedKubeconfig,
+    defaultPath: join(home, '.kube', 'config'),
+    effective,
+    missing: effective.filter((p) => !existsSync(p)),
+  }
+}
 
 export function which(program: string): string | null {
   if (program.includes('/') || program.includes('\\')) return existsSync(program) ? program : null
@@ -157,7 +187,7 @@ export function cancel(id: string) {
 export function kubeconfigFor(context: string): string {
   const file = join(tmpdir(), `axstudio-kubeconfig-${context.replace(/[^\w.-]/g, '_')}.yaml`)
   writeFileSync(file, `apiVersion: v1\nkind: Config\ncurrent-context: ${JSON.stringify(context)}\n`)
-  const base = process.env.KUBECONFIG || join(home, '.kube', 'config')
+  const base = env.KUBECONFIG || join(home, '.kube', 'config')
   return [file, base].join(delimiter)
 }
 

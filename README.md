@@ -23,6 +23,21 @@ AX clusters. Built with Electron, React and TypeScript for macOS, Windows and Li
 The app calls the `ax` CLI and `kubectl`. It passes `--context` on every call,
 so it never changes your global context.
 
+### Choose a kubeconfig file
+
+By default, the app reads the `KUBECONFIG` of its launcher, else `~/.kube/config`.
+To read another file, open the context menu in the toolbar and select
+**Choose kubeconfig file…**. Or open **Settings**, and type the path in the
+**Kubeconfig** field or press **Browse…**. The field accepts more than one
+file, joined by the path separator of the platform (`;` on Windows, `:`
+elsewhere). A `~` at the start of a path expands to your home directory.
+
+The app sets `KUBECONFIG` for its own `ax` and `kubectl` calls only. Your
+shell and your own kubeconfig do not change. The app saves the choice and
+reads it again at the next start. **Use default kubeconfig** in the context
+menu, or an empty field, restores the launch default. When a chosen file does
+not exist, the Settings dialog shows `not found: <path>` in red.
+
 ## Develop
 
 ```sh

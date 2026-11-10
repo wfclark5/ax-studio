@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from 'react'
-import type { CommandResult } from '@shared/api'
+import type { CommandResult, KubeconfigInfo } from '@shared/api'
 import {
   type AXContext, type AXModel, type AXTask, type AXWorkspace, type Phase, type TaskDetail,
   comparePhase, errorSummary, parseContexts, parseModels, parseTaskYAML, parseTasks,
@@ -27,6 +27,8 @@ export interface Settings {
   axPath: string
   repoPath: string
   refreshInterval: number
+  /** KUBECONFIG value for every ax and kubectl call; '' means the launch default (KUBECONFIG, else ~/.kube/config). */
+  kubeconfig: string
 }
 
 export interface State {
@@ -54,6 +56,8 @@ export interface State {
   settings: Settings
   settingsOpen: boolean
   os: string
+  /** The kubeconfig files in effect, as the main process reports them; null until start(). */
+  kubeconfig: KubeconfigInfo | null
 }
 
 /** A terminal session, fixed to the task and context it was opened for. */
@@ -67,7 +71,7 @@ const SECTION_KEY = 'ax-studio.section'
 const CONTEXT_KEY = 'ax-studio.context'
 
 function loadSettings(): Settings {
-  const defaults: Settings = { axPath: 'ax', repoPath: '~/ax', refreshInterval: 4 }
+  const defaults: Settings = { axPath: 'ax', repoPath: '~/ax', refreshInterval: 4, kubeconfig: '' }
   try {
     return { ...defaults, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? '{}') }
   } catch {
@@ -101,6 +105,7 @@ class Store {
     settings: loadSettings(),
     settingsOpen: false,
     os: 'darwin',
+    kubeconfig: null,
   }
 
   private listeners = new Set<() => void>()
@@ -146,8 +151,23 @@ class Store {
     this.started = true
     const info = await window.studio.platform()
     this.set({ os: info.os })
+    // Before the first ax or kubectl call, so they read the chosen file.
+    this.set({ kubeconfig: await window.studio.setKubeconfig(this.state.settings.kubeconfig) })
     await this.loadContexts()
     this.loop()
+  }
+
+  /**
+   * Switches every ax and kubectl call to another kubeconfig file (or files,
+   * joined by the platform's path separator). '' restores the launch default.
+   * The context list is read again from the new file.
+   */
+  async useKubeconfig(value: string) {
+    this.updateSettings({ kubeconfig: value })
+    const kubeconfig = await window.studio.setKubeconfig(value)
+    this.set({ kubeconfig, context: '', contexts: [], tasks: [], workspaces: [], models: [], details: {}, history: [], selectedTaskID: null, connectionError: null })
+    await this.loadContexts()
+    await this.refresh()
   }
 
   private loop = async () => {

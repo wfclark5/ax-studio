@@ -26,17 +26,40 @@ so it never changes your global context.
 ### Choose a kubeconfig file
 
 By default, the app reads the `KUBECONFIG` of its launcher, else `~/.kube/config`.
-To read another file, open the context menu in the toolbar and select
-**Choose kubeconfig file…**. Or open **Settings**, and type the path in the
-**Kubeconfig** field or press **Browse…**. The field accepts more than one
-file, joined by the path separator of the platform (`;` on Windows, `:`
-elsewhere). A `~` at the start of a path expands to your home directory.
+To read another file, open **Clusters**. The **Kubeconfig** card at the top
+shows the files in use, their contexts, and the source of the choice. Press
+**Browse…** to select a file. Press **Use default** to restore the launch
+default.
+
+You can also open **Settings** and type the path in the
+**Kubeconfig** field. The field accepts more than one file, joined by the path
+separator of the platform (`;` on Windows, `:` elsewhere). A `~` at the start
+of a path expands to your home directory.
 
 The app sets `KUBECONFIG` for its own `ax` and `kubectl` calls only. Your
 shell and your own kubeconfig do not change. The app saves the choice and
-reads it again at the next start. **Use default kubeconfig** in the context
-menu, or an empty field, restores the launch default. When a chosen file does
-not exist, the Settings dialog shows `not found: <path>` in red.
+reads it again at the next start. When a chosen file does not exist, the card
+and the Settings dialog show the file in red.
+
+#### Kubeconfig files in WSL (Windows)
+
+On Windows, the **Kubeconfig** card has an **Add from WSL…** button. It lists
+the WSL distros and the kubeconfig files in each distro: `$KUBECONFIG` of the
+login shell, `~/.kube/*`, `/tmp/kubeconfig*`, and each `kubeconfig*` file in
+your home directory. Each entry shows its contexts. Press **Use** to replace
+the choice with that file, or **Add** to append it.
+
+The app stores a WSL file as a UNC path, for example
+`\\wsl.localhost\Ubuntu\home\<user>\.kube\config`. A path that starts with
+`/` also counts as a WSL path, in the default distro. When the choice contains
+a WSL file, the app runs each `ax`, `kubectl`, and setup step inside that
+distro with `wsl.exe -d <distro> --exec /bin/sh -lc`. `KUBECONFIG` is set in
+the distro to the Linux paths. Windows drive paths in the same choice become
+`/mnt/<drive>/...`.
+
+Because the commands run in Linux, exec plugins such as
+`aws eks get-token` work with the WSL login and tools. The app reads the file
+list only. It does not read the file contents.
 
 ## Develop
 

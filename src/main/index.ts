@@ -178,6 +178,8 @@ function registerIPC() {
     if (r.canceled || !r.filePaths.length) return null
     return r.filePaths.join(delimiter)
   })
+  ipcMain.handle('wsl:distros', () => sh.wslDistros())
+  ipcMain.handle('wsl:kubeconfigs', (_e, distro: string) => sh.wslKubeconfigs(distro))
   ipcMain.handle('fileExists', (_e, path: string) => existsSync(expand(path)))
   ipcMain.handle('containerRuntime', () => sh.containerRuntime(join(app.getPath('userData'), 'bin')))
   ipcMain.handle('openYAML', async (_e, defaultDir?: string) => {

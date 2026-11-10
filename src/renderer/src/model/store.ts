@@ -56,6 +56,8 @@ export interface State {
   settings: Settings
   settingsOpen: boolean
   os: string
+  /** The KUBECONFIG list separator of the platform: ':' or ';' on Windows. */
+  pathSeparator: string
   /** The kubeconfig files in effect, as the main process reports them; null until start(). */
   kubeconfig: KubeconfigInfo | null
 }
@@ -105,6 +107,7 @@ class Store {
     settings: loadSettings(),
     settingsOpen: false,
     os: 'darwin',
+    pathSeparator: ':',
     kubeconfig: null,
   }
 
@@ -150,7 +153,7 @@ class Store {
     if (this.started) return
     this.started = true
     const info = await window.studio.platform()
-    this.set({ os: info.os })
+    this.set({ os: info.os, pathSeparator: info.pathSeparator })
     // Before the first ax or kubectl call, so they read the chosen file.
     this.set({ kubeconfig: await window.studio.setKubeconfig(this.state.settings.kubeconfig) })
     await this.loadContexts()

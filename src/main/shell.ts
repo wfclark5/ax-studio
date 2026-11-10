@@ -4,7 +4,10 @@ import { homedir, tmpdir } from 'node:os'
 import { delimiter, join, sep } from 'node:path'
 import DOCKER_SHIM from './docker-shim.sh?raw'
 import type { CommandResult, ContainerRuntime, PipeRequest, RunRequest, SessionRequest, StreamRequest } from '../shared/api'
-import { effectiveKubeconfig, expandHome, splitKubeconfig, type KubeconfigInfo } from '../shared/kubeconfig'
+import {
+  effectiveKubeconfig, expandHome, parseDefaultDistro, parseWslDistros, parseWslKubeconfigs, parseWslPath, splitKubeconfig,
+  WSL_FIND_KUBECONFIGS, wslCommandLine, wslKubeconfigTarget, wslUncPath, type KubeconfigInfo, type WslKubeconfig,
+} from '../shared/kubeconfig'
 
 const isWin = process.platform === 'win32'
 
@@ -42,13 +45,86 @@ const inheritedKubeconfig = process.env.KUBECONFIG ?? ''
 /** The kubeconfig picked in Settings; '' falls back to the inherited value, then ~/.kube/config. */
 let chosenKubeconfig = ''
 
+// MARK: WSL runtime
+//
+// On Windows a kubeconfig inside a WSL distro (\\wsl.localhost\<distro>\… or a
+// /-rooted path) can't be used by the Windows ax.exe and kubectl.exe: its exec
+// plugins and absolute paths only resolve in Linux. So when the chosen
+// kubeconfig points into WSL, every ax, kubectl and sh step runs through
+// `wsl.exe -d <distro> --exec /bin/sh -lc` with KUBECONFIG exported there.
+
+/** Set when the chosen kubeconfig lives in WSL; null means "run natively". */
+let wsl: { distro: string; linuxPaths: string[] } | null = null
+
+const WSL_EXE = isWin ? join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'wsl.exe') : 'wsl.exe'
+/** wsl.exe prints UTF-16 unless told otherwise. */
+const wslEnv = { ...process.env, WSL_UTF8: '1' }
+
+function wslExec(args: string[], timeout = 15000): string {
+  return execFileSync(WSL_EXE, args, { timeout, encoding: 'utf8', env: wslEnv, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] })
+}
+
+export function wslAvailable(): boolean {
+  return isWin && existsSync(WSL_EXE)
+}
+
+let defaultDistroCache: string | null | undefined
+/** The distro `wsl.exe` runs without `-d`, or '' when WSL isn't installed. */
+export function wslDefaultDistro(): string {
+  if (defaultDistroCache !== undefined) return defaultDistroCache ?? ''
+  try {
+    defaultDistroCache = parseDefaultDistro(wslExec(['-l', '-v'])) ?? parseWslDistros(wslExec(['-l', '-q']))[0] ?? null
+  } catch {
+    defaultDistroCache = null
+  }
+  return defaultDistroCache ?? ''
+}
+
+export function wslDistros(): string[] {
+  if (!wslAvailable()) return []
+  try {
+    return parseWslDistros(wslExec(['-l', '-q']))
+  } catch {
+    return []
+  }
+}
+
+/** The arguments that run a sh script inside a distro. `--exec` skips the WSL shell, so no second round of quoting. */
+function wslArgs(distro: string, script: string): string[] {
+  return ['-d', distro, '--exec', '/bin/sh', '-lc', script]
+}
+
+/** Kubeconfig files found inside a distro, with the contexts each defines. Read-only; nothing is written. */
+export function wslKubeconfigs(distro: string): Promise<WslKubeconfig[]> {
+  return new Promise((resolve) => {
+    const child = spawn(WSL_EXE, wslArgs(distro, WSL_FIND_KUBECONFIGS), { env: wslEnv, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] })
+    let out = ''
+    const timer = setTimeout(() => child.kill(), 60000)
+    child.stdout.setEncoding('utf8').on('data', (d) => (out += d))
+    child.on('error', () => { clearTimeout(timer); resolve([]) })
+    child.on('close', () => { clearTimeout(timer); resolve(parseWslKubeconfigs(distro, out)) })
+  })
+}
+
+/** Does a path exist, looking through \\wsl.localhost for Linux paths when WSL is in use? */
+function pathExists(p: string): boolean {
+  const w = parseWslPath(p)
+  if (w && !w.distro) {
+    const distro = wsl?.distro || wslDefaultDistro()
+    return isWin ? !!distro && existsSync(wslUncPath(distro, w.linuxPath)) : existsSync(p)
+  }
+  return existsSync(p)
+}
+
 /**
  * Points every spawned ax, kubectl and shell step at the given kubeconfig
  * file(s). The user's own kubeconfig and global context stay untouched.
  */
 export function setKubeconfig(value: string): KubeconfigInfo {
   chosenKubeconfig = value.trim()
-  const chosen = splitKubeconfig(chosenKubeconfig, delimiter).map((p) => expandHome(p, home, sep)).join(delimiter)
+  const paths = splitKubeconfig(chosenKubeconfig, delimiter).map((p) => expandHome(p, home, sep))
+  wsl = isWin && wslAvailable() ? wslKubeconfigTarget(paths, wslDefaultDistro()) : null
+  const chosen = paths.join(delimiter)
   if (chosen) env.KUBECONFIG = chosen
   else if (inheritedKubeconfig) env.KUBECONFIG = inheritedKubeconfig
   else delete env.KUBECONFIG
@@ -62,11 +138,24 @@ export function kubeconfigInfo(): KubeconfigInfo {
     inherited: inheritedKubeconfig,
     defaultPath: join(home, '.kube', 'config'),
     effective,
-    missing: effective.filter((p) => !existsSync(p)),
+    missing: effective.filter((p) => !pathExists(p)),
+    wsl,
+  }
+}
+
+function wslWhich(program: string): string | null {
+  if (!wsl) return null
+  try {
+    const out = wslExec(wslArgs(wsl.distro, wslCommandLine({ kubeconfig: wsl.linuxPaths, commandLine: `command -v ${JSON.stringify(program)}` })))
+    const p = out.trim().split('\n')[0]?.trim()
+    return p || null
+  } catch {
+    return null
   }
 }
 
 export function which(program: string): string | null {
+  if (wsl) return wslWhich(program)
   if (program.includes('/') || program.includes('\\')) return existsSync(program) ? program : null
   const exts = isWin ? (process.env.PATHEXT ?? '.EXE;.CMD;.BAT').split(';').concat(['']) : ['']
   for (const dir of PATH.split(delimiter)) {
@@ -78,12 +167,18 @@ export function which(program: string): string | null {
   return null
 }
 
+/** What to spawn for `program args…`: the program itself, or wsl.exe wrapping it. */
+function command(program: string, args: string[], opts: { cwd?: string; extra?: Record<string, string> } = {}): [string, string[]] {
+  if (wsl) return [WSL_EXE, wslArgs(wsl.distro, wslCommandLine({ kubeconfig: wsl.linuxPaths, program, args, cwd: opts.cwd, extra: opts.extra }))]
+  return [which(program) ?? program, args]
+}
+
 export function run(req: RunRequest): Promise<CommandResult> {
   return new Promise((resolve) => {
-    const program = which(req.program) ?? req.program
+    const [program, args] = command(req.program, req.args, { cwd: req.cwd, extra: req.env })
     let child: ChildProcess
     try {
-      child = spawn(program, req.args, { cwd: req.cwd, env: { ...env, ...req.env }, windowsHide: true })
+      child = spawn(program, args, { cwd: wsl ? undefined : req.cwd, env: { ...env, ...req.env }, windowsHide: true })
     } catch (e) {
       resolve({ status: 127, stdout: '', stderr: String(e) })
       return
@@ -105,7 +200,6 @@ export function run(req: RunRequest): Promise<CommandResult> {
  */
 export function pipe(req: PipeRequest): Promise<CommandResult> {
   return new Promise((resolve) => {
-    const program = which(req.program) ?? req.program
     let stdout = ''
     let stderr = ''
     let failed: number | null = null
@@ -114,8 +208,10 @@ export function pipe(req: PipeRequest): Promise<CommandResult> {
       if (code !== 0 && failed === null) failed = code ?? 1
       if (--left === 0) resolve({ status: failed ?? 0, stdout, stderr })
     }
-    const from = spawn(program, req.from, { env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
-    const to = spawn(program, req.to, { env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
+    const [fromProgram, fromArgs] = command(req.program, req.from)
+    const [toProgram, toArgs] = command(req.program, req.to)
+    const from = spawn(fromProgram, fromArgs, { env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    const to = spawn(toProgram, toArgs, { env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
     from.stdout.pipe(to.stdin)
     // A reader that quits early shouldn't crash the main process with EPIPE.
     to.stdin.on('error', () => {})
@@ -134,19 +230,20 @@ export function pipe(req: PipeRequest): Promise<CommandResult> {
   })
 }
 
-/** The shell used for cluster setup steps. Steps are POSIX sh; on Windows prefer Git Bash. */
-function shellFor(commandLine: string): [string, string[]] {
-  if (!isWin) return ['/bin/sh', ['-c', commandLine]]
+/** The shell used for cluster setup steps. Steps are POSIX sh; on Windows prefer Git Bash, or WSL when the kubeconfig is there. */
+function shellFor(req: StreamRequest): [string, string[]] {
+  if (wsl) return [WSL_EXE, wslArgs(wsl.distro, wslCommandLine({ kubeconfig: wsl.linuxPaths, commandLine: req.commandLine, cwd: req.cwd, extra: req.env }))]
+  if (!isWin) return ['/bin/sh', ['-c', req.commandLine]]
   const bash = which('bash')
-  return bash ? [bash, ['-lc', commandLine]] : ['cmd.exe', ['/d', '/s', '/c', commandLine]]
+  return bash ? [bash, ['-lc', req.commandLine]] : ['cmd.exe', ['/d', '/s', '/c', req.commandLine]]
 }
 
 const streams = new Map<string, ChildProcess>()
 
 export function stream(req: StreamRequest, onLine: (line: string) => void, onExit: (status: number) => void) {
-  const [sh, args] = shellFor(req.commandLine)
+  const [sh, args] = shellFor(req)
   // Its own process group on unix, so cancel reaches the whole pipeline (make, go, kind…).
-  const child = spawn(sh, args, { cwd: req.cwd, env: { ...env, ...req.env }, windowsHide: true, detached: !isWin })
+  const child = spawn(sh, args, { cwd: wsl ? undefined : req.cwd, env: { ...env, ...req.env }, windowsHide: true, detached: !isWin })
   streams.set(req.id, child)
   // stdout and stderr share one buffer each so partial lines are never split.
   const buffers = { out: '', err: '' }
@@ -182,11 +279,18 @@ export function cancel(id: string) {
 /**
  * A kubeconfig that only sets current-context, prepended to KUBECONFIG, so
  * kubectl calls in the Makefile hit the chosen cluster without changing the
- * user's global context.
+ * user's global context. With a WSL kubeconfig the file is written into the
+ * distro's /tmp (through \\wsl.localhost) and Linux paths are returned.
  */
 export function kubeconfigFor(context: string): string {
-  const file = join(tmpdir(), `axstudio-kubeconfig-${context.replace(/[^\w.-]/g, '_')}.yaml`)
-  writeFileSync(file, `apiVersion: v1\nkind: Config\ncurrent-context: ${JSON.stringify(context)}\n`)
+  const name = `axstudio-kubeconfig-${context.replace(/[^\w.-]/g, '_')}.yaml`
+  const body = `apiVersion: v1\nkind: Config\ncurrent-context: ${JSON.stringify(context)}\n`
+  if (wsl) {
+    writeFileSync(wslUncPath(wsl.distro, `/tmp/${name}`), body)
+    return [`/tmp/${name}`, ...wsl.linuxPaths].join(':')
+  }
+  const file = join(tmpdir(), name)
+  writeFileSync(file, body)
   const base = env.KUBECONFIG || join(home, '.kube', 'config')
   return [file, base].join(delimiter)
 }
@@ -199,7 +303,8 @@ export function kubeconfigFor(context: string): string {
 export function containerRuntime(shimDir: string): ContainerRuntime {
   if (which('docker')) return { runtime: 'docker', env: {} }
   if (!which('podman')) return { runtime: null, env: {} }
-  if (isWin) return { runtime: 'podman', env: { KIND_EXPERIMENTAL_PROVIDER: 'podman' } }
+  // Inside WSL the shim dir would be a Windows path; kind's podman provider is enough there.
+  if (isWin || wsl) return { runtime: 'podman', env: { KIND_EXPERIMENTAL_PROVIDER: 'podman' } }
   mkdirSync(shimDir, { recursive: true })
   const shim = join(shimDir, 'docker')
   writeFileSync(shim, DOCKER_SHIM)
@@ -214,8 +319,8 @@ const sessions = new Map<string, ChildProcess>()
  * chunks, since prompts don't end in a newline.
  */
 export function startSession(req: SessionRequest, onData: (data: string, stream: 'stdout' | 'stderr') => void, onExit: (status: number) => void) {
-  const program = which(req.program) ?? req.program
-  const child = spawn(program, req.args, { env: { ...env, TERM: 'dumb' }, windowsHide: true })
+  const [program, args] = command(req.program, req.args, { extra: { TERM: 'dumb' } })
+  const child = spawn(program, args, { env: { ...env, TERM: 'dumb' }, windowsHide: true })
   sessions.set(req.id, child)
   child.stdout?.setEncoding('utf8').on('data', (d: string) => onData(d, 'stdout'))
   child.stderr?.setEncoding('utf8').on('data', (d: string) => onData(d, 'stderr'))

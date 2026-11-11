@@ -1,8 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  defaultKubeconfig, effectiveKubeconfig, expandHome, parseDefaultDistro, parseWslDistros, parseWslKubeconfigs, parseWslPath,
-  shellQuote, splitKubeconfig, windowsToWslPath, wslCommandLine, wslKubeconfigTarget, wslUncPath,
+  defaultKubeconfig, effectiveKubeconfig, expandHome, isKubeconfigName, LOCAL_SOURCE, parseContextNames, parseDefaultDistro, parseFoundKubeconfigs,
+  parseWslDistros, parseWslPath, shellQuote, splitKubeconfig, windowsToWslPath, wslCommandLine, wslKubeconfigTarget, wslSource, wslSourceDistro, wslUncPath,
 } from './kubeconfig.ts'
 
 const HOME = '/home/u'
@@ -93,9 +93,28 @@ test('parseWslDistros and parseDefaultDistro handle UTF-16 noise', () => {
   assert.equal(parseDefaultDistro('  NAME\r\n  Deb  Stopped  2\r\n'), null)
 })
 
-test('parseWslKubeconfigs dedupes, splits contexts and drops files without one', () => {
-  const out = parseWslKubeconfigs('Ubuntu', '/home/u/.kube/config\tkind-ax,dev\n/tmp/kc\t\n/home/u/.kube/config\tkind-ax\nnot-a-path\tx\n')
+test('parseFoundKubeconfigs dedupes, splits contexts, drops files without one and maps the value', () => {
+  const out = parseFoundKubeconfigs('wsl:Ubuntu', '/home/u/.kube/config\tkind-ax,dev\n/tmp/kc\t\n/home/u/.kube/config\tkind-ax\nnot-a-path\tx\n',
+    (p) => wslUncPath('Ubuntu', p))
   assert.deepEqual(out, [
-    { distro: 'Ubuntu', linuxPath: '/home/u/.kube/config', uncPath: '\\\\wsl.localhost\\Ubuntu\\home\\u\\.kube\\config', contexts: ['kind-ax', 'dev'] },
+    { source: 'wsl:Ubuntu', path: '/home/u/.kube/config', value: '\\\\wsl.localhost\\Ubuntu\\home\\u\\.kube\\config', contexts: ['kind-ax', 'dev'] },
   ])
+  assert.deepEqual(parseFoundKubeconfigs('local', '/a\tx\n', (p) => p), [{ source: 'local', path: '/a', value: '/a', contexts: ['x'] }])
+})
+
+test('parseContextNames', () => {
+  assert.deepEqual(parseContextNames('a\r\nb\n\n'), ['a', 'b'])
+  assert.deepEqual(parseContextNames(''), [])
+})
+
+test('kubeconfig sources and names', () => {
+  assert.equal(LOCAL_SOURCE.id, 'local')
+  assert.deepEqual(wslSource('Ubuntu'), { id: 'wsl:Ubuntu', label: 'WSL · Ubuntu' })
+  assert.equal(wslSourceDistro('wsl:Ubuntu-22.04'), 'Ubuntu-22.04')
+  assert.equal(wslSourceDistro('local'), null)
+  assert.equal(wslSourceDistro('wsl:'), null)
+  assert.ok(isKubeconfigName('kubeconfig-ax-e2e'))
+  assert.ok(isKubeconfigName('KubeConfig.yaml'))
+  assert.ok(!isKubeconfigName('config'))
+  assert.ok(!isKubeconfigName('my-kubeconfig'))
 })

@@ -1,9 +1,9 @@
 import { useEffect, useState, type CSSProperties } from 'react'
 import {
   Boxes, Check, Circle, CircleCheck, Copy, CircleDashed, CircleX, Cpu, ExternalLink, FileKey2, FolderOpen, Layers3, Loader, Play, Plus,
-  RefreshCw, Server, Square, SquareTerminal, Terminal, Trash2, TriangleAlert, Wrench, X, type LucideIcon,
+  RefreshCw, Search, Server, Square, SquareTerminal, Terminal, Trash2, TriangleAlert, Wrench, X, type LucideIcon,
 } from 'lucide-react'
-import type { WslKubeconfig } from '@shared/api'
+import type { FoundKubeconfig, KubeconfigSource } from '@shared/api'
 import { clusters, useClusters, STAGES, type Cluster, type Operation, type Replicas } from '../model/clusters'
 import { store, useStore } from '../model/store'
 import { Chip, Empty, LogConsole, PageHeader } from '../components'
@@ -80,13 +80,14 @@ export function Clusters() {
 
 /**
  * Which kubeconfig file(s) AX Studio reads, and how to change them: a file
- * dialog, the launch default, or (on Windows) a file inside a WSL distro.
- * With a WSL file, ax and kubectl run inside that distro.
+ * dialog, a search of the usual places (this computer, or a WSL distro on
+ * Windows), or the launch default. With a WSL file, ax and kubectl run inside
+ * that distro.
  */
 function KubeconfigCard() {
   const s = useStore()
   const info = s.kubeconfig
-  const [wslOpen, setWslOpen] = useState(false)
+  const [findOpen, setFindOpen] = useState(false)
   const chosen = s.settings.kubeconfig.trim()
   const source = chosen ? 'chosen in Studio' : info?.inherited ? 'KUBECONFIG from the launcher' : 'kubectl default'
   const contexts = s.contexts.map((c) => c.name)
@@ -107,12 +108,10 @@ function KubeconfigCard() {
         <button className="btn small" onClick={() => void browse()} title="Pick one or more kubeconfig files. Your own kubeconfig does not change.">
           <FolderOpen size={12} />Browse…
         </button>
-        {s.os === 'win32' && (
-          <button className={`btn small ${wslOpen ? 'active' : ''}`} onClick={() => setWslOpen(!wslOpen)}
-            title="List the kubeconfig files inside your WSL distros and use one of them">
-            <Terminal size={12} />Add from WSL…
-          </button>
-        )}
+        <button className={`btn small ${findOpen ? 'active' : ''}`} onClick={() => setFindOpen(!findOpen)}
+          title="List the kubeconfig files in the usual places (~/.kube, $KUBECONFIG, kubeconfig* files; WSL distros on Windows) and use one of them">
+          <Search size={12} />Find…
+        </button>
         {chosen && (
           <button className="btn small ghost" onClick={() => void store.useKubeconfig('')} title="Back to KUBECONFIG from the launcher, else ~/.kube/config">
             <X size={12} />Use default
@@ -145,37 +144,44 @@ function KubeconfigCard() {
         ))}
       </div>
       {s.connectionError && <div className="row problem-line selectable" style={{ marginTop: 0 }}><TriangleAlert size={13} />{s.connectionError}</div>}
-      {wslOpen && <WslPicker onClose={() => setWslOpen(false)} />}
+      {findOpen && <FindPicker onClose={() => setFindOpen(false)} />}
     </div>
   )
 }
 
-/** Lists the kubeconfig files inside each WSL distro; Use replaces the list, Add appends. */
-function WslPicker({ onClose }: { onClose: () => void }) {
+/**
+ * Lists the kubeconfig files found in one source: this computer, or a WSL
+ * distro on Windows. Use replaces the list, Add appends.
+ */
+function FindPicker({ onClose }: { onClose: () => void }) {
   const s = useStore()
-  const [distros, setDistros] = useState<string[] | null>(null)
-  const [distro, setDistro] = useState('')
-  const [files, setFiles] = useState<WslKubeconfig[] | null>(null)
+  const [sources, setSources] = useState<KubeconfigSource[] | null>(null)
+  const [source, setSource] = useState('')
+  const [files, setFiles] = useState<FoundKubeconfig[] | null>(null)
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
     let live = true
-    void window.studio.wslDistros().then((d) => {
+    void window.studio.kubeconfigSources().then((list) => {
       if (!live) return
-      setDistros(d)
-      setDistro((cur) => cur || s.kubeconfig?.wsl?.distro || d[0] || '')
+      setSources(list)
+      // Start in the source of the kubeconfig in use: the WSL distro when it is one.
+      const wsl = s.kubeconfig?.wsl?.distro
+      setSource((cur) => cur || (wsl && list.find((x) => x.id === `wsl:${wsl}`)?.id) || list[0]?.id || '')
     })
     return () => { live = false }
   }, [])
 
   useEffect(() => {
-    if (!distro) return
+    if (!source) return
     let live = true
     setFiles(null)
-    void window.studio.wslKubeconfigs(distro).then((f) => live && setFiles(f))
+    void window.studio.findKubeconfigs(source).then((f) => live && setFiles(f))
     return () => { live = false }
-  }, [distro])
+  }, [source])
 
+  const label = sources?.find((x) => x.id === source)?.label ?? source
+  const isWsl = source.startsWith('wsl:')
   const current = s.kubeconfig?.effective ?? []
   const apply = async (paths: string[]) => {
     setBusy(true)
@@ -187,42 +193,43 @@ function WslPicker({ onClose }: { onClose: () => void }) {
   }
 
   return (
-    <div className="wsl-picker">
-      <div className="row wsl-picker-head">
-        <span>Kubeconfig files in WSL</span>
-        {distros && distros.length > 1 && (
-          <select className="input" value={distro} onChange={(e) => setDistro(e.target.value)}>
-            {distros.map((d) => <option key={d} value={d}>{d}</option>)}
+    <div className="kc-picker">
+      <div className="row kc-picker-head">
+        <span>Kubeconfig files found</span>
+        {sources && sources.length > 1 && (
+          <select className="input" value={source} onChange={(e) => setSource(e.target.value)}>
+            {sources.map((x) => <option key={x.id} value={x.id}>{x.label}</option>)}
           </select>
         )}
-        {distros && distros.length === 1 && <span className="mono faint">{distro}</span>}
+        {sources && sources.length === 1 && <span className="faint">{label}</span>}
         <div className="spacer" />
         <button className="btn small icon ghost" onClick={onClose} title="Close"><X size={12} /></button>
       </div>
       <div className="caption">
-        Looks in <span className="mono">~/.kube</span>, <span className="mono">/tmp/kubeconfig*</span>, <span className="mono">$KUBECONFIG</span> of a login shell,
-        and <span className="mono">kubeconfig*</span> files under your home. With one of these, ax and kubectl run inside the distro, so exec plugins such as
-        <span className="mono"> aws eks get-token</span> work.
+        Looks in <span className="mono">~/.kube</span>, <span className="mono">$KUBECONFIG</span>, <span className="mono">kubeconfig*</span> files in the
+        temp directory and under your home. Only file names and context names are read.
+        {isWsl && <> With a WSL file, ax and kubectl run inside the distro, so exec plugins such as <span className="mono">aws eks get-token</span> work.</>}
       </div>
-      {distros && distros.length === 0 && <div className="row problem-line"><TriangleAlert size={13} />No WSL distro found (wsl.exe -l -q listed nothing).</div>}
-      {distro && files === null && <div className="row faint"><Loader size={13} className="spin" />Listing files in {distro}…</div>}
-      {files && files.length === 0 && <div className="row faint">No kubeconfig files found in {distro}.</div>}
+      {source && files === null && <div className="row faint"><Loader size={13} className="spin" />Looking in {label}…</div>}
+      {files && files.length === 0 && (
+        <div className="row faint">No kubeconfig file with a context found in {label}{isWsl ? '' : ', or kubectl is not on PATH'}.</div>
+      )}
       {files && files.map((f) => {
-        const inUse = current.includes(f.uncPath)
+        const inUse = current.includes(f.value)
         return (
-          <div key={f.linuxPath} className="wsl-file">
+          <div key={f.value} className="kc-file">
             <div className="row">
-              <span className="mono selectable ellipsis" title={f.uncPath}>{f.linuxPath}</span>
+              <span className="mono selectable ellipsis" title={f.value}>{f.path}</span>
               <div className="spacer" />
               {inUse ? <span className="faint">in use</span> : (
                 <>
-                  <button className="btn small primary" disabled={busy} onClick={() => void apply([f.uncPath])} title="Use only this file">Use</button>
-                  <button className="btn small" disabled={busy} onClick={() => void apply([...current, f.uncPath])} title="Add it after the files in use">Add</button>
+                  <button className="btn small primary" disabled={busy} onClick={() => void apply([f.value])} title="Use only this file">Use</button>
+                  <button className="btn small" disabled={busy} onClick={() => void apply([...current, f.value])} title="Add it after the files in use">Add</button>
                 </>
               )}
             </div>
-            <div className="row wsl-file-ctx">
-              {f.contexts.length ? f.contexts.map((c) => <span key={c} className="chip">{c}</span>) : <span className="faint">no contexts (kubectl could not read it)</span>}
+            <div className="row kc-file-ctx">
+              {f.contexts.map((c) => <span key={c} className="chip">{c}</span>)}
             </div>
           </div>
         )

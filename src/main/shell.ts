@@ -1,13 +1,15 @@
-import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
+import { spawn, execFile, execFileSync, type ChildProcess } from 'node:child_process'
 import { existsSync, mkdirSync, writeFileSync, chmodSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { delimiter, join, sep } from 'node:path'
 import DOCKER_SHIM from './docker-shim.sh?raw'
 import type { CommandResult, ContainerRuntime, PipeRequest, RunRequest, SessionRequest, StreamRequest } from '../shared/api'
 import {
-  effectiveKubeconfig, expandHome, parseDefaultDistro, parseWslDistros, parseWslKubeconfigs, parseWslPath, splitKubeconfig,
-  WSL_FIND_KUBECONFIGS, wslCommandLine, wslKubeconfigTarget, wslUncPath, type KubeconfigInfo, type WslKubeconfig,
+  effectiveKubeconfig, expandHome, LOCAL_SOURCE, parseContextNames, parseDefaultDistro, parseFoundKubeconfigs, parseWslDistros, parseWslPath,
+  splitKubeconfig, WSL_FIND_KUBECONFIGS, wslCommandLine, wslKubeconfigTarget, wslSource, wslSourceDistro, wslUncPath,
+  type FoundKubeconfig, type KubeconfigInfo, type KubeconfigSource,
 } from '../shared/kubeconfig'
+import { localKubeconfigCandidates } from './discovery'
 
 const isWin = process.platform === 'win32'
 
@@ -95,19 +97,60 @@ function wslArgs(distro: string, script: string): string[] {
 }
 
 /** Kubeconfig files found inside a distro, with the contexts each defines. Read-only; nothing is written. */
-export function wslKubeconfigs(distro: string): Promise<WslKubeconfig[]> {
+function wslKubeconfigs(distro: string): Promise<FoundKubeconfig[]> {
   return new Promise((resolve) => {
     const child = spawn(WSL_EXE, wslArgs(distro, WSL_FIND_KUBECONFIGS), { env: wslEnv, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] })
     let out = ''
     const timer = setTimeout(() => child.kill(), 60000)
     child.stdout.setEncoding('utf8').on('data', (d) => (out += d))
     child.on('error', () => { clearTimeout(timer); resolve([]) })
-    child.on('close', () => { clearTimeout(timer); resolve(parseWslKubeconfigs(distro, out)) })
+    child.on('close', () => { clearTimeout(timer); resolve(parseFoundKubeconfigs(wslSource(distro).id, out, (p) => wslUncPath(distro, p))) })
   })
 }
 
+// MARK: Kubeconfig discovery
+//
+// "Find…" in the Clusters view. Every OS has the local source: $KUBECONFIG of
+// the launcher, ~/.kube/*, <tmp>/kubeconfig* and kubeconfig* files under the
+// home directory. Windows adds one source per WSL distro. Only file names and
+// context names are read; kubectl parses the files.
+
+/** Where kubeconfig files can be looked for on this machine. */
+export function kubeconfigSources(): KubeconfigSource[] {
+  return [LOCAL_SOURCE, ...wslDistros().map(wslSource)]
+}
+
+/** The contexts a file defines, through the native kubectl; [] when kubectl is absent or cannot parse the file. */
+function contextsOf(kubectl: string, file: string): Promise<string[]> {
+  return new Promise((resolve) => {
+    execFile(kubectl, ['--kubeconfig', file, 'config', 'get-contexts', '-o', 'name'], { timeout: 10000, encoding: 'utf8', env, windowsHide: true },
+      (err, stdout) => resolve(err ? [] : parseContextNames(stdout)))
+  })
+}
+
+async function localKubeconfigs(): Promise<FoundKubeconfig[]> {
+  const kubectl = nativeWhich('kubectl')
+  if (!kubectl) return []
+  const files = localKubeconfigCandidates(home, tmpdir(), inheritedKubeconfig, delimiter, sep)
+  const out: FoundKubeconfig[] = []
+  // A few at a time: each is a kubectl process.
+  for (let i = 0; i < files.length; i += 4) {
+    const batch = files.slice(i, i + 4)
+    const contexts = await Promise.all(batch.map((f) => contextsOf(kubectl, f)))
+    batch.forEach((f, j) => contexts[j].length && out.push({ source: LOCAL_SOURCE.id, path: f, value: f, contexts: contexts[j] }))
+  }
+  return out
+}
+
+/** Kubeconfig files in a source ('local' or 'wsl:<distro>'), with the contexts each defines. */
+export function findKubeconfigs(sourceId: string): Promise<FoundKubeconfig[]> {
+  const distro = wslSourceDistro(sourceId)
+  if (distro) return wslAvailable() ? wslKubeconfigs(distro) : Promise.resolve([])
+  return localKubeconfigs()
+}
+
 /** Does a path exist, looking through \\wsl.localhost for Linux paths when WSL is in use? */
-function pathExists(p: string): boolean {
+export function pathExists(p: string): boolean {
   const w = parseWslPath(p)
   if (w && !w.distro) {
     const distro = wsl?.distro || wslDefaultDistro()
@@ -155,7 +198,11 @@ function wslWhich(program: string): string | null {
 }
 
 export function which(program: string): string | null {
-  if (wsl) return wslWhich(program)
+  return wsl ? wslWhich(program) : nativeWhich(program)
+}
+
+/** `which` on this OS, whatever the kubeconfig target. */
+function nativeWhich(program: string): string | null {
   if (program.includes('/') || program.includes('\\')) return existsSync(program) ? program : null
   const exts = isWin ? (process.env.PATHEXT ?? '.EXE;.CMD;.BAT').split(';').concat(['']) : ['']
   for (const dir of PATH.split(delimiter)) {

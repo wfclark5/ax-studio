@@ -28,8 +28,14 @@ so it never changes your global context.
 By default, the app reads the `KUBECONFIG` of its launcher, else `~/.kube/config`.
 To read another file, open **Clusters**. The **Kubeconfig** card at the top
 shows the files in use, their contexts, and the source of the choice. Press
-**Browse…** to select a file. Press **Use default** to restore the launch
-default.
+**Browse…** to select a file. Press **Find…** to list the kubeconfig files in
+the usual places. Press **Use default** to restore the launch default.
+
+**Find…** looks in `$KUBECONFIG` of the launcher, `~/.kube/*`, `kubeconfig*`
+files in the temp directory, and `kubeconfig*` files under your home directory.
+Each entry shows its contexts. Press **Use** to replace the choice with that
+file, or **Add** to append it. The app reads the file names and the context
+names only. It does not read the file contents.
 
 You can also open **Settings** and type the path in the
 **Kubeconfig** field. The field accepts more than one file, joined by the path
@@ -43,11 +49,9 @@ and the Settings dialog show the file in red.
 
 #### Kubeconfig files in WSL (Windows)
 
-On Windows, the **Kubeconfig** card has an **Add from WSL…** button. It lists
-the WSL distros and the kubeconfig files in each distro: `$KUBECONFIG` of the
-login shell, `~/.kube/*`, `/tmp/kubeconfig*`, and each `kubeconfig*` file in
-your home directory. Each entry shows its contexts. Press **Use** to replace
-the choice with that file, or **Add** to append it.
+On Windows, **Find…** has a source menu: **This computer**, and one entry for
+each WSL distro. In a distro, the search covers the same places, with
+`$KUBECONFIG` of the login shell.
 
 The app stores a WSL file as a UNC path, for example
 `\\wsl.localhost\Ubuntu\home\<user>\.kube\config`. A path that starts with
@@ -58,8 +62,7 @@ the distro to the Linux paths. Windows drive paths in the same choice become
 `/mnt/<drive>/...`.
 
 Because the commands run in Linux, exec plugins such as
-`aws eks get-token` work with the WSL login and tools. The app reads the file
-list only. It does not read the file contents.
+`aws eks get-token` work with the WSL login and tools.
 
 ## Develop
 

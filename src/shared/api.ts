@@ -2,8 +2,8 @@
 // touches Node directly; everything that spawns processes or touches the
 // filesystem goes through these calls.
 
-import type { KubeconfigInfo, WslKubeconfig } from './kubeconfig'
-export type { KubeconfigInfo, WslKubeconfig }
+import type { FoundKubeconfig, KubeconfigInfo, KubeconfigSource } from './kubeconfig'
+export type { FoundKubeconfig, KubeconfigInfo, KubeconfigSource }
 
 export interface CommandResult {
   status: number
@@ -106,10 +106,11 @@ export interface StudioAPI {
   kubeconfigInfo(): Promise<KubeconfigInfo>
   /** A file dialog for one or more kubeconfig files; returns a KUBECONFIG value or null if cancelled. */
   pickKubeconfig(current: string): Promise<string | null>
-  /** WSL distros on this Windows machine (`wsl.exe -l -q`); [] elsewhere or without WSL. */
-  wslDistros(): Promise<string[]>
-  /** Kubeconfig files found inside a distro, with the contexts each defines. */
-  wslKubeconfigs(distro: string): Promise<WslKubeconfig[]>
+  /** Where kubeconfig files can be looked for: this computer, plus each WSL distro on Windows. */
+  kubeconfigSources(): Promise<KubeconfigSource[]>
+  /** Kubeconfig files found in a source, with the contexts each defines. Read-only. */
+  findKubeconfigs(sourceId: string): Promise<FoundKubeconfig[]>
+  /** Does the file exist? Linux and \\wsl.localhost paths are looked up through WSL on Windows. */
   fileExists(path: string): Promise<boolean>
   containerRuntime(): Promise<ContainerRuntime>
   openYAML(defaultDir?: string): Promise<{ path: string; text: string } | null>

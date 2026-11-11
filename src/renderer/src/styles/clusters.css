@@ -16,13 +16,13 @@
 .kubeconfig-contexts { gap: 6px; flex-wrap: wrap; font-size: 12px; }
 .ctx-chip { cursor: pointer; }
 .ctx-chip.active { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 55%, transparent); background: var(--accent-soft); }
-.wsl-picker { border-top: 1px solid var(--border); padding-top: 10px; display: flex; flex-direction: column; gap: 8px; }
-.wsl-picker-head { gap: 10px; font-weight: 600; }
-.wsl-picker-head select { height: 26px; font-size: 12px; }
-.wsl-file { padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
-.wsl-file .row { gap: 8px; }
-.wsl-file .ellipsis { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.wsl-file-ctx { flex-wrap: wrap; gap: 4px; }
+.kc-picker { border-top: 1px solid var(--border); padding-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+.kc-picker-head { gap: 10px; font-weight: 600; }
+.kc-picker-head select { height: 26px; font-size: 12px; }
+.kc-file { padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+.kc-file .row { gap: 8px; }
+.kc-file .ellipsis { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kc-file-ctx { flex-wrap: wrap; gap: 4px; }
 
 .cluster-card { position: relative; overflow: hidden; padding: 14px; display: flex; flex-direction: column; gap: 12px; }
 .cluster-card.busy { border-color: color-mix(in srgb, var(--accent) 55%, transparent); }

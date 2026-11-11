@@ -1,5 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, shell, type MenuItemConstructorOptions } from 'electron'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { delimiter, join } from 'node:path'
 import * as sh from './shell'
@@ -178,9 +178,9 @@ function registerIPC() {
     if (r.canceled || !r.filePaths.length) return null
     return r.filePaths.join(delimiter)
   })
-  ipcMain.handle('wsl:distros', () => sh.wslDistros())
-  ipcMain.handle('wsl:kubeconfigs', (_e, distro: string) => sh.wslKubeconfigs(distro))
-  ipcMain.handle('fileExists', (_e, path: string) => existsSync(expand(path)))
+  ipcMain.handle('kubeconfig:sources', () => sh.kubeconfigSources())
+  ipcMain.handle('kubeconfig:find', (_e, sourceId: string) => sh.findKubeconfigs(sourceId))
+  ipcMain.handle('fileExists', (_e, path: string) => sh.pathExists(expand(path)))
   ipcMain.handle('containerRuntime', () => sh.containerRuntime(join(app.getPath('userData'), 'bin')))
   ipcMain.handle('openYAML', async (_e, defaultDir?: string) => {
     const r = await dialog.showOpenDialog(win!, {

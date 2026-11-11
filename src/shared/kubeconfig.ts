@@ -160,41 +160,81 @@ export function parseDefaultDistro(stdout: string): string | null {
   return null
 }
 
-/** One kubeconfig file found inside a distro, with the contexts it defines. */
-export interface WslKubeconfig {
-  distro: string
-  linuxPath: string
-  /** What to put in the kubeconfig setting on Windows. */
-  uncPath: string
+// MARK: Discovery
+//
+// "Find…" in the Clusters view lists kubeconfig files in the usual places of a
+// source: this computer, or a WSL distro on Windows. The list is read-only.
+
+/** Where kubeconfig files can be looked for. */
+export interface KubeconfigSource {
+  /** 'local' or 'wsl:<distro>' */
+  id: string
+  /** Shown in the picker: "This computer", "WSL · Ubuntu". */
+  label: string
+}
+
+export const LOCAL_SOURCE: KubeconfigSource = { id: 'local', label: 'This computer' }
+
+export function wslSource(distro: string): KubeconfigSource {
+  return { id: `wsl:${distro}`, label: `WSL · ${distro}` }
+}
+
+/** The distro of a 'wsl:<distro>' source id, or null for any other id. */
+export function wslSourceDistro(id: string): string | null {
+  return id.startsWith('wsl:') && id.length > 4 ? id.slice(4) : null
+}
+
+/** One kubeconfig file found in a source, with the contexts it defines. */
+export interface FoundKubeconfig {
+  source: string
+  /** The path as the source sees it: a native path, or a Linux path inside a distro. */
+  path: string
+  /** What to put in the kubeconfig setting: the native path, or a \\wsl.localhost UNC path. */
+  value: string
   contexts: string[]
 }
 
-/** Script that prints `path<TAB>ctx1,ctx2` for each kubeconfig file in the usual places. */
+/** Directories never searched for kubeconfig files. */
+export const SKIP_DIRS = new Set(['node_modules', '.git', '.cache', '.npm', 'Library', 'AppData'])
+/** Files named `kubeconfig*` count; `.kube/*` and `$KUBECONFIG` are added by the caller. */
+export const isKubeconfigName = (name: string): boolean => name.toLowerCase().startsWith('kubeconfig')
+export const FIND_MAX_DEPTH = 7
+export const FIND_MAX_FILES = 50
+
+/** Script that prints `path<TAB>ctx1,ctx2` for each kubeconfig file in the usual places of a Linux home. */
 export const WSL_FIND_KUBECONFIGS = [
   'export PATH="$HOME/.local/bin:$HOME/go/bin:/usr/local/go/bin:$PATH"',
   'list() { for f in "$@"; do [ -f "$f" ] && printf "%s\\n" "$f"; done; }',
   'ifs=$IFS; IFS=:; kc=$(list $KUBECONFIG); IFS=$ifs',
   '{ printf "%s\\n" "$kc"; list "$HOME/.kube/config" "$HOME"/.kube/* /tmp/kubeconfig*;',
-  '  find "$HOME" -maxdepth 7 \\( -name node_modules -o -name .git -o -name .cache -o -name .npm \\) -prune -o -type f -name "kubeconfig*" -print 2>/dev/null | head -50; } |',
+  `  find "$HOME" -maxdepth ${FIND_MAX_DEPTH} \\( -name node_modules -o -name .git -o -name .cache -o -name .npm \\) -prune -o -type f -name "kubeconfig*" -print 2>/dev/null | head -${FIND_MAX_FILES}; } |`,
   'awk "NF && !seen[\\$0]++" | while IFS= read -r f; do',
   '  ctx=$(kubectl --kubeconfig "$f" config get-contexts -o name 2>/dev/null | paste -sd, -)',
   '  printf "%s\\t%s\\n" "$f" "$ctx"',
   'done',
 ].join('\n')
 
-/** Parses the output of WSL_FIND_KUBECONFIGS. Files without a context are dropped. */
-export function parseWslKubeconfigs(distro: string, stdout: string): WslKubeconfig[] {
-  const out: WslKubeconfig[] = []
+/** Parses the output of `kubectl config get-contexts -o name`: one context per line. */
+export function parseContextNames(stdout: string): string[] {
+  return stdout.replace(/\u0000/g, '').split(/\r?\n/).map((c) => c.trim()).filter(Boolean)
+}
+
+/**
+ * Parses `path<TAB>ctx1,ctx2` lines (the WSL script's output). `toValue`
+ * turns the path into the setting value. Duplicates and files without a
+ * context are dropped: no context means kubectl could not parse the file.
+ */
+export function parseFoundKubeconfigs(source: string, stdout: string, toValue: (path: string) => string): FoundKubeconfig[] {
+  const out: FoundKubeconfig[] = []
   for (const raw of stdout.replace(/\u0000/g, '').split(/\r?\n/)) {
     const line = raw.trimEnd()
     if (!line) continue
     const tab = line.indexOf('\t')
-    const linuxPath = (tab >= 0 ? line.slice(0, tab) : line).trim()
-    if (!linuxPath.startsWith('/') || out.some((k) => k.linuxPath === linuxPath)) continue
+    const path = (tab >= 0 ? line.slice(0, tab) : line).trim()
+    if (!path.startsWith('/') || out.some((k) => k.path === path)) continue
     const contexts = tab >= 0 ? line.slice(tab + 1).split(',').map((c) => c.trim()).filter(Boolean) : []
-    // No context means kubectl could not parse the file (a backup, a note…): not worth offering.
     if (contexts.length === 0) continue
-    out.push({ distro, linuxPath, uncPath: wslUncPath(distro, linuxPath), contexts })
+    out.push({ source, path, value: toValue(path), contexts })
   }
   return out
 }

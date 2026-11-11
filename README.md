@@ -23,6 +23,62 @@ AX clusters. Built with Electron, React and TypeScript for macOS, Windows and Li
 The app calls the `ax` CLI and `kubectl`. It passes `--context` on every call,
 so it never changes your global context.
 
+### Choose a kubeconfig file
+
+By default, the app reads the `KUBECONFIG` of its launcher, else `~/.kube/config`.
+To read another file, open **Clusters**. The **Kubeconfig** card at the top
+shows the files in use, their contexts, and the source of the choice. Press
+**Browse…** to select a file. Press **Find…** to list the kubeconfig files in
+the usual places. Press **Use default** to restore the launch default.
+
+**Find…** looks in `$KUBECONFIG` of the launcher, `~/.kube/*`, `kubeconfig*`
+files in the temp directory, and `kubeconfig*` files under your home directory.
+Each entry shows its contexts. Press **Use** to replace the choice with that
+file, or **Add** to append it. The app reads the file names and the context
+names only. It does not read the file contents.
+
+You can also open **Settings** and type the path in the
+**Kubeconfig** field. The field accepts more than one file, joined by the path
+separator of the platform (`;` on Windows, `:` elsewhere). A `~` at the start
+of a path expands to your home directory.
+
+The app sets `KUBECONFIG` for its own `ax` and `kubectl` calls only. Your
+shell and your own kubeconfig do not change. The app saves the choice and
+reads it again at the next start. When a chosen file does not exist, the card
+and the Settings dialog show the file in red.
+
+#### Kubeconfig files in WSL (Windows)
+
+On Windows, **Find…** has a source menu: **This computer**, and one entry for
+each WSL distro. In a distro, the search covers the same places, with
+`$KUBECONFIG` of the login shell.
+
+The app stores a WSL file as a UNC path, for example
+`\\wsl.localhost\Ubuntu\home\<user>\.kube\config`. A path that starts with
+`/` also counts as a WSL path, in the default distro. When the choice contains
+a WSL file, the app runs each `ax`, `kubectl`, and setup step inside that
+distro with `wsl.exe -d <distro> --exec /bin/sh -lc`. `KUBECONFIG` is set in
+the distro to the Linux paths. Windows drive paths in the same choice become
+`/mnt/<drive>/...`.
+
+Because the commands run in Linux, exec plugins such as
+`aws eks get-token` work with the WSL login and tools.
+
+### The ax-server tunnel
+
+`ax` reaches its server through `kubectl port-forward -n ax-system
+svc/ax-server`. The CLI starts that forward itself and stops after 5 seconds
+when it is not ready. On a slow link, the forward needs more time, and each
+`ax` call fails. One known case is WSL with `dnsTunneling`: the IPv6 lookup of
+an EKS endpoint can take 10 seconds.
+
+For this reason, the app keeps one forward per context, and gives its URL to
+each `ax` call as `AX_SERVER`. The app waits up to 90 seconds for the forward to start.
+It stays open until it exits, until you choose another kubeconfig, or until
+the app quits. When the forward cannot start, the sidebar shows the `kubectl`
+error. `ax version`, `ax tunnel`, and `ax ctx` do not use the forward. The
+`AX_SYSTEM_NAMESPACE` variable changes the namespace, as it does for `ax`.
+
 ## Develop
 
 ```sh

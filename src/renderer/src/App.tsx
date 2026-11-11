@@ -269,8 +269,8 @@ function SettingsModal() {
           <input className="input mono" value={repoPath} onChange={(e) => setRepoPath(e.target.value)} />
           <label>Refresh</label>
           <div className="row">
-            <input type="range" min={2} max={30} step={1} value={interval} onChange={(e) => setIntervalValue(+e.target.value)} style={{ flex: 1 }} />
-            <span className="mono" style={{ width: 32, textAlign: 'right' }}>{interval}s</span>
+            <input type="range" min={2} max={30} step={1} value={interval} onChange={(e) => setIntervalValue(+e.target.value)} style={{ flex: 1, margin: 0 }} />
+            <span className="mono faint" style={{ width: 32, textAlign: 'right' }}>{interval}s</span>
           </div>
         </div>
         <div className="row" style={{ marginTop: 18, justifyContent: 'flex-end' }}>

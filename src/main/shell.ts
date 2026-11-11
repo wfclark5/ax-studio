@@ -10,6 +10,8 @@ import {
   type FoundKubeconfig, type KubeconfigInfo, type KubeconfigSource,
 } from '../shared/kubeconfig'
 import { localKubeconfigCandidates } from './discovery'
+import { Tunnels } from './tunnel'
+import { axContextArg, axNeedsServer, isAx } from '../shared/tunnel'
 
 const isWin = process.platform === 'win32'
 
@@ -165,6 +167,8 @@ export function pathExists(p: string): boolean {
  */
 export function setKubeconfig(value: string): KubeconfigInfo {
   chosenKubeconfig = value.trim()
+  // Another file means other clusters: the forwards to the old ones are useless.
+  tunnels.stopAll()
   const paths = splitKubeconfig(chosenKubeconfig, delimiter).map((p) => expandHome(p, home, sep))
   wsl = isWin && wslAvailable() ? wslKubeconfigTarget(paths, wslDefaultDistro()) : null
   const chosen = paths.join(delimiter)
@@ -220,12 +224,41 @@ function command(program: string, args: string[], opts: { cwd?: string; extra?: 
   return [which(program) ?? program, args]
 }
 
-export function run(req: RunRequest): Promise<CommandResult> {
+// MARK: ax-server tunnel
+//
+// ax reaches its server through its own `kubectl port-forward`, which it gives
+// up on after 5 s. Over a slow link (WSL with tunnelled DNS, a VPN) that is too
+// short, so every call fails and the app looks hung. The app keeps one forward
+// per context instead and hands its URL to ax as AX_SERVER.
+
+const tunnels = new Tunnels((args) => {
+  const [program, kargs] = command('kubectl', args)
+  return spawn(program, kargs, { env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+})
+
+/**
+ * The extra variables for `program args…`: the caller's, plus AX_SERVER when
+ * this is an ax call that needs the server. Throws the tunnel's message when
+ * the forward cannot start; the caller reports it as the command's stderr.
+ */
+async function withAxServer(program: string, args: string[], extra?: Record<string, string>): Promise<Record<string, string> | undefined> {
+  if (!isAx(program) || !axNeedsServer(args, extra)) return extra
+  const url = await tunnels.ensure(axContextArg(args))
+  return { ...extra, AX_SERVER: url }
+}
+
+export async function run(req: RunRequest): Promise<CommandResult> {
+  let extra: Record<string, string> | undefined
+  try {
+    extra = await withAxServer(req.program, req.args, req.env)
+  } catch (e) {
+    return { status: 1, stdout: '', stderr: (e as Error).message }
+  }
   return new Promise((resolve) => {
-    const [program, args] = command(req.program, req.args, { cwd: req.cwd, extra: req.env })
+    const [program, args] = command(req.program, req.args, { cwd: req.cwd, extra })
     let child: ChildProcess
     try {
-      child = spawn(program, args, { cwd: wsl ? undefined : req.cwd, env: { ...env, ...req.env }, windowsHide: true })
+      child = spawn(program, args, { cwd: wsl ? undefined : req.cwd, env: { ...env, ...extra }, windowsHide: true })
     } catch (e) {
       resolve({ status: 127, stdout: '', stderr: String(e) })
       return
@@ -245,7 +278,14 @@ export function run(req: RunRequest): Promise<CommandResult> {
  * Runs `program from… | program to…` with raw bytes in between, e.g. a tar
  * stream from one task's `ax ssh` into another's. Fails if either side does.
  */
-export function pipe(req: PipeRequest): Promise<CommandResult> {
+export async function pipe(req: PipeRequest): Promise<CommandResult> {
+  let fromExtra: Record<string, string> | undefined
+  let toExtra: Record<string, string> | undefined
+  try {
+    ;[fromExtra, toExtra] = await Promise.all([withAxServer(req.program, req.from), withAxServer(req.program, req.to)])
+  } catch (e) {
+    return { status: 1, stdout: '', stderr: (e as Error).message }
+  }
   return new Promise((resolve) => {
     let stdout = ''
     let stderr = ''
@@ -255,10 +295,10 @@ export function pipe(req: PipeRequest): Promise<CommandResult> {
       if (code !== 0 && failed === null) failed = code ?? 1
       if (--left === 0) resolve({ status: failed ?? 0, stdout, stderr })
     }
-    const [fromProgram, fromArgs] = command(req.program, req.from)
-    const [toProgram, toArgs] = command(req.program, req.to)
-    const from = spawn(fromProgram, fromArgs, { env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
-    const to = spawn(toProgram, toArgs, { env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
+    const [fromProgram, fromArgs] = command(req.program, req.from, { extra: fromExtra })
+    const [toProgram, toArgs] = command(req.program, req.to, { extra: toExtra })
+    const from = spawn(fromProgram, fromArgs, { env: { ...env, ...fromExtra }, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    const to = spawn(toProgram, toArgs, { env: { ...env, ...toExtra }, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
     from.stdout.pipe(to.stdin)
     // A reader that quits early shouldn't crash the main process with EPIPE.
     to.stdin.on('error', () => {})
@@ -360,14 +400,29 @@ export function containerRuntime(shimDir: string): ContainerRuntime {
 }
 
 const sessions = new Map<string, ChildProcess>()
+/** Sessions closed before their tunnel was ready; startSession then does not spawn. */
+const closedBeforeStart = new Set<string>()
 
 /**
  * Runs an interactive program with piped stdio. Output goes out as raw
  * chunks, since prompts don't end in a newline.
  */
-export function startSession(req: SessionRequest, onData: (data: string, stream: 'stdout' | 'stderr') => void, onExit: (status: number) => void) {
-  const [program, args] = command(req.program, req.args, { extra: { TERM: 'dumb' } })
-  const child = spawn(program, args, { env: { ...env, TERM: 'dumb' }, windowsHide: true })
+export async function startSession(req: SessionRequest, onData: (data: string, stream: 'stdout' | 'stderr') => void, onExit: (status: number) => void) {
+  let extra: Record<string, string>
+  try {
+    extra = (await withAxServer(req.program, req.args, { TERM: 'dumb' })) ?? { TERM: 'dumb' }
+  } catch (e) {
+    onData((e as Error).message + '\n', 'stderr')
+    onExit(1)
+    return
+  }
+  // Closed while the tunnel was starting.
+  if (closedBeforeStart.delete(req.id)) {
+    onExit(130)
+    return
+  }
+  const [program, args] = command(req.program, req.args, { extra })
+  const child = spawn(program, args, { env: { ...env, ...extra }, windowsHide: true })
   sessions.set(req.id, child)
   child.stdout?.setEncoding('utf8').on('data', (d: string) => onData(d, 'stdout'))
   child.stderr?.setEncoding('utf8').on('data', (d: string) => onData(d, 'stderr'))
@@ -394,11 +449,18 @@ export function endSessionInput(id: string) {
 
 export function closeSession(id: string) {
   const child = sessions.get(id)
-  if (child && !child.killed) child.kill()
+  if (!child) closedBeforeStart.add(id)
+  else if (!child.killed) child.kill()
 }
 
 /** Streams run in their own process groups, so stop them when the app quits. */
 export function cancelAll() {
   for (const id of streams.keys()) cancel(id)
   for (const id of sessions.keys()) closeSession(id)
+  tunnels.stopAll()
+}
+
+/** Contexts with a live ax-server forward (for diagnostics). */
+export function activeTunnels(): string[] {
+  return tunnels.active()
 }

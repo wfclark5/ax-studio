@@ -64,6 +64,21 @@ the distro to the Linux paths. Windows drive paths in the same choice become
 Because the commands run in Linux, exec plugins such as
 `aws eks get-token` work with the WSL login and tools.
 
+### The ax-server tunnel
+
+`ax` reaches its server through `kubectl port-forward -n ax-system
+svc/ax-server`. The CLI starts that forward itself and stops after 5 seconds
+when it is not ready. On a slow link, the forward needs more time, and each
+`ax` call fails. One known case is WSL with `dnsTunneling`: the IPv6 lookup of
+an EKS endpoint can take 10 seconds.
+
+For this reason, the app keeps one forward per context, and gives its URL to
+each `ax` call as `AX_SERVER`. The app waits up to 90 seconds for the forward to start.
+It stays open until it exits, until you choose another kubeconfig, or until
+the app quits. When the forward cannot start, the sidebar shows the `kubectl`
+error. `ax version`, `ax tunnel`, and `ax ctx` do not use the forward. The
+`AX_SYSTEM_NAMESPACE` variable changes the namespace, as it does for `ax`.
+
 ## Develop
 
 ```sh

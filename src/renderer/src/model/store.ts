@@ -210,21 +210,23 @@ class Store {
     // first, and the kube default may be unreachable.
     const saved = localStorage.getItem(CONTEXT_KEY)
     const via = saved ? ['--context', saved] : []
-    const r = result(await window.studio.run({ program: this.state.settings.axPath, args: [...via, 'config', 'get-contexts'] }))
+    // The ax probe may wait for the server tunnel (slow DNS, a cold exec
+    // plugin). kubectl's contexts need no network, so show them first: the
+    // user can pick a context while ax still connects.
+    const probe = window.studio.run({ program: this.state.settings.axPath, args: [...via, 'config', 'get-contexts'] })
+    const fromKube = await kubeContexts()
+    if (fromKube.length) this.set({ contexts: fromKube, context: this.state.context || this.pickContext(fromKube, saved, false) })
+    const r = result(await probe)
     let contexts: AXContext[]
     if (r.ok) {
       contexts = parseContexts(r.stdout)
       this.set({ axConfig: true })
-    } else if (/unknown command/i.test(r.stderr + r.stdout)) {
-      // This ax has no `ax config`: it follows kubectl's contexts. It prints
-      // its usage after the error, so look at all of the output.
-      contexts = await kubeContexts()
-      this.set({ axConfig: false })
     } else {
-      // An ax without `ax config` connects before it parses the command, so an
-      // unreachable cluster hides the unknown command. Still list kubectl's
-      // contexts so the user can switch to one that works.
-      contexts = await kubeContexts()
+      // This ax has no `ax config`: it follows kubectl's contexts. It prints
+      // its usage after the error, so look at all of the output. When the
+      // cluster is unreachable the error hides the unknown command; the
+      // kubectl contexts still let the user switch to one that works.
+      contexts = fromKube
       this.set({ axConfig: false })
       // With contexts to pick from, refresh reports the chosen one's errors.
       if (!contexts.length) {
@@ -232,9 +234,14 @@ class Store {
         return
       }
     }
+    this.set({ contexts, context: this.state.context || this.pickContext(contexts, saved, this.state.axConfig) })
+  }
+
+  /** The context to start with: ?context=, then the last used one, then the file's current one, then the first. */
+  private pickContext(contexts: AXContext[], saved: string | null, axConfig: boolean): string {
     const asked = new URLSearchParams(location.search).get('context')
     const last = contexts.find((c) => c.name === saved)?.name
-    this.set({ contexts, context: this.state.context || asked || last || contexts.find((c) => c.isCurrent)?.name || (this.state.axConfig ? 'local' : contexts[0]?.name ?? '') })
+    return asked || last || contexts.find((c) => c.isCurrent)?.name || (axConfig ? 'local' : contexts[0]?.name ?? '')
   }
 
   // MARK: Running ax

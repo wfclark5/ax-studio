@@ -65,5 +65,11 @@ html:not([data-os='darwin']) .sidebar-top { height: 14px; }
 .menu-sep { height: 1px; background: var(--border); margin: 4px 6px; }
 .menu-heading { padding: 2px 10px 4px; text-transform: uppercase; letter-spacing: .04em; font-size: 10.5px; }
 
-.form-grid { display: grid; grid-template-columns: 120px 1fr; gap: 12px 14px; align-items: center; }
-.form-grid > label { color: var(--text-2); text-align: right; }
+.form-grid { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 12px 14px; align-items: start; }
+/* Labels line up with the first control of the row (28px .input), not with the row's centre. */
+.form-grid > label { color: var(--text-2); text-align: right; line-height: 28px; }
+.form-grid > :not(label) { min-width: 0; }
+/* A row of controls (slider, toggle) is as tall as an input, so its label lines up too. */
+.form-grid > .row { min-height: 28px; }
+/* Long paths wrap inside the modal instead of widening the grid. */
+.form-grid .caption { overflow-wrap: anywhere; line-height: 1.4; }

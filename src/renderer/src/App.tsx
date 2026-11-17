@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Boxes, Gauge, Laptop, Network, RefreshCw, Server, Settings as SettingsIcon, SquarePen, SquareTerminal, ChevronDown, Check, type LucideIcon } from 'lucide-react'
+import { Boxes, FileKey, Gauge, Laptop, Network, RefreshCw, Server, Settings as SettingsIcon, SquarePen, SquareTerminal, ChevronDown, Check, type LucideIcon } from 'lucide-react'
 import { store, useStore, type Section } from './model/store'
 import logo from './assets/axel.svg'
 import { designer } from './model/designer'
@@ -133,6 +133,12 @@ function trayAction(action: string) {
 
 const contextIcon = (c?: AXContext) => (c?.name === 'local' ? Laptop : Server)
 
+/** Opens the file dialog and, if a file was picked, switches ax and kubectl to it. */
+async function pickKubeconfig() {
+  const picked = await window.studio.pickKubeconfig(store.state.settings.kubeconfig)
+  if (picked !== null) await store.useKubeconfig(picked)
+}
+
 function Toolbar() {
   const s = useStore()
   const current = store.currentContext
@@ -172,6 +178,20 @@ function Toolbar() {
                     <span className="menu-check" />Make Default for ax CLI
                   </button>
                 </>
+              )}
+              <div className="menu-sep" />
+              <button className="menu-item" title="Read contexts from another kubeconfig file. Your own kubeconfig does not change."
+                onClick={() => { close(); void pickKubeconfig() }}>
+                <span className="menu-check" /><FileKey size={13} />
+                <span className="col">
+                  <span>Choose kubeconfig file…</span>
+                  {s.kubeconfig && <span className="caption faint mono ellipsis" style={{ maxWidth: 320 }}>{s.kubeconfig.effective.join(' · ')}</span>}
+                </span>
+              </button>
+              {s.settings.kubeconfig && (
+                <button className="menu-item" onClick={() => { close(); void store.useKubeconfig('') }}>
+                  <span className="menu-check" />Use default kubeconfig
+                </button>
               )}
             </>
           )}
@@ -243,6 +263,7 @@ function SettingsModal() {
   const [axPath, setAxPath] = useState(s.settings.axPath)
   const [repoPath, setRepoPath] = useState(s.settings.repoPath)
   const [interval, setIntervalValue] = useState(s.settings.refreshInterval)
+  const [kubeconfig, setKubeconfig] = useState(s.settings.kubeconfig)
   const [resolved, setResolved] = useState<string | null | undefined>(undefined)
   useEffect(() => {
     const t = setTimeout(() => void window.studio.which(axPath).then(setResolved), 200)
@@ -251,10 +272,20 @@ function SettingsModal() {
   const close = () => store.set({ settingsOpen: false })
   const save = () => {
     const axChanged = axPath !== s.settings.axPath
+    const kubeChanged = kubeconfig.trim() !== s.settings.kubeconfig
     store.updateSettings({ axPath, repoPath, refreshInterval: interval })
     close()
-    if (axChanged) void store.loadContexts().then(() => store.refresh())
+    if (kubeChanged) void store.useKubeconfig(kubeconfig.trim())
+    else if (axChanged) void store.loadContexts().then(() => store.refresh())
   }
+  const browse = async () => {
+    const picked = await window.studio.pickKubeconfig(kubeconfig)
+    if (picked !== null) setKubeconfig(picked)
+  }
+  const info = s.kubeconfig
+  // What the unsaved field would resolve to: the field itself, else the launch default.
+  const effective = kubeconfig.trim() ? kubeconfig.trim() : info ? (info.inherited || info.defaultPath) : ''
+  const missing = info && !kubeconfig.trim() ? info.missing : []
   return (
     <div className="modal-backdrop" onMouseDown={close}>
       <div className="modal card fade-in" onMouseDown={(e) => e.stopPropagation()}>
@@ -267,6 +298,19 @@ function SettingsModal() {
           </div>
           <label>AX repository</label>
           <input className="input mono" value={repoPath} onChange={(e) => setRepoPath(e.target.value)} />
+          <label>Kubeconfig</label>
+          <div className="col" style={{ gap: 4 }}>
+            <div className="row">
+              <input className="input mono" style={{ flex: 1 }} value={kubeconfig} placeholder={info ? (info.inherited || info.defaultPath) : '~/.kube/config'}
+                title="One or more kubeconfig files, joined by the path separator. Empty uses KUBECONFIG from the launcher, else ~/.kube/config."
+                onChange={(e) => setKubeconfig(e.target.value)} />
+              <button className="btn" onClick={() => void browse()}>Browse…</button>
+            </div>
+            <span className={`caption mono ${missing.length ? '' : 'faint'}`} style={missing.length ? { color: 'var(--red)' } : undefined}>
+              {missing.length ? `not found: ${missing.join(', ')}` : effective}
+              {!kubeconfig.trim() && info?.inherited ? ' (from the launcher)' : ''}
+            </span>
+          </div>
           <label>Refresh</label>
           <div className="row">
             <input type="range" min={2} max={30} step={1} value={interval} onChange={(e) => setIntervalValue(+e.target.value)} style={{ flex: 1 }} />

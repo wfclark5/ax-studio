@@ -1,9 +1,17 @@
-import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
+import { spawn, execFile, execFileSync, type ChildProcess } from 'node:child_process'
 import { existsSync, mkdirSync, writeFileSync, chmodSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { delimiter, join } from 'node:path'
+import { delimiter, join, sep } from 'node:path'
 import DOCKER_SHIM from './docker-shim.sh?raw'
 import type { CommandResult, ContainerRuntime, PipeRequest, RunRequest, SessionRequest, StreamRequest } from '../shared/api'
+import {
+  effectiveKubeconfig, expandHome, LOCAL_SOURCE, parseContextNames, parseDefaultDistro, parseFoundKubeconfigs, parseWslDistros, parseWslPath,
+  splitKubeconfig, WSL_FIND_KUBECONFIGS, wslCommandLine, wslKubeconfigTarget, wslSource, wslSourceDistro, wslUncPath,
+  type FoundKubeconfig, type KubeconfigInfo, type KubeconfigSource,
+} from '../shared/kubeconfig'
+import { localKubeconfigCandidates } from './discovery'
+import { Tunnels } from './tunnel'
+import { axContextArg, axNeedsServer, isAx } from '../shared/tunnel'
 
 const isWin = process.platform === 'win32'
 
@@ -36,7 +44,169 @@ const PATH = [...new Set([...loginPath().split(delimiter), ...extra].filter(Bool
 
 export const env: NodeJS.ProcessEnv = { ...process.env, PATH }
 
+/** KUBECONFIG as the app was launched: a launcher script may have set it. */
+const inheritedKubeconfig = process.env.KUBECONFIG ?? ''
+/** The kubeconfig picked in Settings; '' falls back to the inherited value, then ~/.kube/config. */
+let chosenKubeconfig = ''
+
+// MARK: WSL runtime
+//
+// On Windows a kubeconfig inside a WSL distro (\\wsl.localhost\<distro>\… or a
+// /-rooted path) can't be used by the Windows ax.exe and kubectl.exe: its exec
+// plugins and absolute paths only resolve in Linux. So when the chosen
+// kubeconfig points into WSL, every ax, kubectl and sh step runs through
+// `wsl.exe -d <distro> --exec /bin/sh -lc` with KUBECONFIG exported there.
+
+/** Set when the chosen kubeconfig lives in WSL; null means "run natively". */
+let wsl: { distro: string; linuxPaths: string[] } | null = null
+
+const WSL_EXE = isWin ? join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'wsl.exe') : 'wsl.exe'
+/** wsl.exe prints UTF-16 unless told otherwise. */
+const wslEnv = { ...process.env, WSL_UTF8: '1' }
+
+function wslExec(args: string[], timeout = 15000): string {
+  return execFileSync(WSL_EXE, args, { timeout, encoding: 'utf8', env: wslEnv, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] })
+}
+
+export function wslAvailable(): boolean {
+  return isWin && existsSync(WSL_EXE)
+}
+
+let defaultDistroCache: string | null | undefined
+/** The distro `wsl.exe` runs without `-d`, or '' when WSL isn't installed. */
+export function wslDefaultDistro(): string {
+  if (defaultDistroCache !== undefined) return defaultDistroCache ?? ''
+  try {
+    defaultDistroCache = parseDefaultDistro(wslExec(['-l', '-v'])) ?? parseWslDistros(wslExec(['-l', '-q']))[0] ?? null
+  } catch {
+    defaultDistroCache = null
+  }
+  return defaultDistroCache ?? ''
+}
+
+export function wslDistros(): string[] {
+  if (!wslAvailable()) return []
+  try {
+    return parseWslDistros(wslExec(['-l', '-q']))
+  } catch {
+    return []
+  }
+}
+
+/** The arguments that run a sh script inside a distro. `--exec` skips the WSL shell, so no second round of quoting. */
+function wslArgs(distro: string, script: string): string[] {
+  return ['-d', distro, '--exec', '/bin/sh', '-lc', script]
+}
+
+/** Kubeconfig files found inside a distro, with the contexts each defines. Read-only; nothing is written. */
+function wslKubeconfigs(distro: string): Promise<FoundKubeconfig[]> {
+  return new Promise((resolve) => {
+    const child = spawn(WSL_EXE, wslArgs(distro, WSL_FIND_KUBECONFIGS), { env: wslEnv, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] })
+    let out = ''
+    const timer = setTimeout(() => child.kill(), 60000)
+    child.stdout.setEncoding('utf8').on('data', (d) => (out += d))
+    child.on('error', () => { clearTimeout(timer); resolve([]) })
+    child.on('close', () => { clearTimeout(timer); resolve(parseFoundKubeconfigs(wslSource(distro).id, out, (p) => wslUncPath(distro, p))) })
+  })
+}
+
+// MARK: Kubeconfig discovery
+//
+// "Find…" in the Clusters view. Every OS has the local source: $KUBECONFIG of
+// the launcher, ~/.kube/*, <tmp>/kubeconfig* and kubeconfig* files under the
+// home directory. Windows adds one source per WSL distro. Only file names and
+// context names are read; kubectl parses the files.
+
+/** Where kubeconfig files can be looked for on this machine. */
+export function kubeconfigSources(): KubeconfigSource[] {
+  return [LOCAL_SOURCE, ...wslDistros().map(wslSource)]
+}
+
+/** The contexts a file defines, through the native kubectl; [] when kubectl is absent or cannot parse the file. */
+function contextsOf(kubectl: string, file: string): Promise<string[]> {
+  return new Promise((resolve) => {
+    execFile(kubectl, ['--kubeconfig', file, 'config', 'get-contexts', '-o', 'name'], { timeout: 10000, encoding: 'utf8', env, windowsHide: true },
+      (err, stdout) => resolve(err ? [] : parseContextNames(stdout)))
+  })
+}
+
+async function localKubeconfigs(): Promise<FoundKubeconfig[]> {
+  const kubectl = nativeWhich('kubectl')
+  if (!kubectl) return []
+  const files = localKubeconfigCandidates(home, tmpdir(), inheritedKubeconfig, delimiter, sep)
+  const out: FoundKubeconfig[] = []
+  // A few at a time: each is a kubectl process.
+  for (let i = 0; i < files.length; i += 4) {
+    const batch = files.slice(i, i + 4)
+    const contexts = await Promise.all(batch.map((f) => contextsOf(kubectl, f)))
+    batch.forEach((f, j) => contexts[j].length && out.push({ source: LOCAL_SOURCE.id, path: f, value: f, contexts: contexts[j] }))
+  }
+  return out
+}
+
+/** Kubeconfig files in a source ('local' or 'wsl:<distro>'), with the contexts each defines. */
+export function findKubeconfigs(sourceId: string): Promise<FoundKubeconfig[]> {
+  const distro = wslSourceDistro(sourceId)
+  if (distro) return wslAvailable() ? wslKubeconfigs(distro) : Promise.resolve([])
+  return localKubeconfigs()
+}
+
+/** Does a path exist, looking through \\wsl.localhost for Linux paths when WSL is in use? */
+export function pathExists(p: string): boolean {
+  const w = parseWslPath(p)
+  if (w && !w.distro) {
+    const distro = wsl?.distro || wslDefaultDistro()
+    return isWin ? !!distro && existsSync(wslUncPath(distro, w.linuxPath)) : existsSync(p)
+  }
+  return existsSync(p)
+}
+
+/**
+ * Points every spawned ax, kubectl and shell step at the given kubeconfig
+ * file(s). The user's own kubeconfig and global context stay untouched.
+ */
+export function setKubeconfig(value: string): KubeconfigInfo {
+  chosenKubeconfig = value.trim()
+  // Another file means other clusters: the forwards to the old ones are useless.
+  tunnels.stopAll()
+  const paths = splitKubeconfig(chosenKubeconfig, delimiter).map((p) => expandHome(p, home, sep))
+  wsl = isWin && wslAvailable() ? wslKubeconfigTarget(paths, wslDefaultDistro()) : null
+  const chosen = paths.join(delimiter)
+  if (chosen) env.KUBECONFIG = chosen
+  else if (inheritedKubeconfig) env.KUBECONFIG = inheritedKubeconfig
+  else delete env.KUBECONFIG
+  return kubeconfigInfo()
+}
+
+export function kubeconfigInfo(): KubeconfigInfo {
+  const effective = effectiveKubeconfig(chosenKubeconfig, inheritedKubeconfig, home, delimiter, sep)
+  return {
+    chosen: chosenKubeconfig,
+    inherited: inheritedKubeconfig,
+    defaultPath: join(home, '.kube', 'config'),
+    effective,
+    missing: effective.filter((p) => !pathExists(p)),
+    wsl,
+  }
+}
+
+function wslWhich(program: string): string | null {
+  if (!wsl) return null
+  try {
+    const out = wslExec(wslArgs(wsl.distro, wslCommandLine({ kubeconfig: wsl.linuxPaths, commandLine: `command -v ${JSON.stringify(program)}` })))
+    const p = out.trim().split('\n')[0]?.trim()
+    return p || null
+  } catch {
+    return null
+  }
+}
+
 export function which(program: string): string | null {
+  return wsl ? wslWhich(program) : nativeWhich(program)
+}
+
+/** `which` on this OS, whatever the kubeconfig target. */
+function nativeWhich(program: string): string | null {
   if (program.includes('/') || program.includes('\\')) return existsSync(program) ? program : null
   const exts = isWin ? (process.env.PATHEXT ?? '.EXE;.CMD;.BAT').split(';').concat(['']) : ['']
   for (const dir of PATH.split(delimiter)) {
@@ -48,12 +218,47 @@ export function which(program: string): string | null {
   return null
 }
 
-export function run(req: RunRequest): Promise<CommandResult> {
+/** What to spawn for `program args…`: the program itself, or wsl.exe wrapping it. */
+function command(program: string, args: string[], opts: { cwd?: string; extra?: Record<string, string> } = {}): [string, string[]] {
+  if (wsl) return [WSL_EXE, wslArgs(wsl.distro, wslCommandLine({ kubeconfig: wsl.linuxPaths, program, args, cwd: opts.cwd, extra: opts.extra }))]
+  return [which(program) ?? program, args]
+}
+
+// MARK: ax-server tunnel
+//
+// ax reaches its server through its own `kubectl port-forward`, which it gives
+// up on after 5 s. Over a slow link (WSL with tunnelled DNS, a VPN) that is too
+// short, so every call fails and the app looks hung. The app keeps one forward
+// per context instead and hands its URL to ax as AX_SERVER.
+
+const tunnels = new Tunnels((args) => {
+  const [program, kargs] = command('kubectl', args)
+  return spawn(program, kargs, { env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+})
+
+/**
+ * The extra variables for `program args…`: the caller's, plus AX_SERVER when
+ * this is an ax call that needs the server. Throws the tunnel's message when
+ * the forward cannot start; the caller reports it as the command's stderr.
+ */
+async function withAxServer(program: string, args: string[], extra?: Record<string, string>): Promise<Record<string, string> | undefined> {
+  if (!isAx(program) || !axNeedsServer(args, extra)) return extra
+  const url = await tunnels.ensure(axContextArg(args))
+  return { ...extra, AX_SERVER: url }
+}
+
+export async function run(req: RunRequest): Promise<CommandResult> {
+  let extra: Record<string, string> | undefined
+  try {
+    extra = await withAxServer(req.program, req.args, req.env)
+  } catch (e) {
+    return { status: 1, stdout: '', stderr: (e as Error).message }
+  }
   return new Promise((resolve) => {
-    const program = which(req.program) ?? req.program
+    const [program, args] = command(req.program, req.args, { cwd: req.cwd, extra })
     let child: ChildProcess
     try {
-      child = spawn(program, req.args, { cwd: req.cwd, env: { ...env, ...req.env }, windowsHide: true })
+      child = spawn(program, args, { cwd: wsl ? undefined : req.cwd, env: { ...env, ...extra }, windowsHide: true })
     } catch (e) {
       resolve({ status: 127, stdout: '', stderr: String(e) })
       return
@@ -73,9 +278,15 @@ export function run(req: RunRequest): Promise<CommandResult> {
  * Runs `program from… | program to…` with raw bytes in between, e.g. a tar
  * stream from one task's `ax ssh` into another's. Fails if either side does.
  */
-export function pipe(req: PipeRequest): Promise<CommandResult> {
+export async function pipe(req: PipeRequest): Promise<CommandResult> {
+  let fromExtra: Record<string, string> | undefined
+  let toExtra: Record<string, string> | undefined
+  try {
+    ;[fromExtra, toExtra] = await Promise.all([withAxServer(req.program, req.from), withAxServer(req.program, req.to)])
+  } catch (e) {
+    return { status: 1, stdout: '', stderr: (e as Error).message }
+  }
   return new Promise((resolve) => {
-    const program = which(req.program) ?? req.program
     let stdout = ''
     let stderr = ''
     let failed: number | null = null
@@ -84,8 +295,10 @@ export function pipe(req: PipeRequest): Promise<CommandResult> {
       if (code !== 0 && failed === null) failed = code ?? 1
       if (--left === 0) resolve({ status: failed ?? 0, stdout, stderr })
     }
-    const from = spawn(program, req.from, { env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
-    const to = spawn(program, req.to, { env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
+    const [fromProgram, fromArgs] = command(req.program, req.from, { extra: fromExtra })
+    const [toProgram, toArgs] = command(req.program, req.to, { extra: toExtra })
+    const from = spawn(fromProgram, fromArgs, { env: { ...env, ...fromExtra }, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    const to = spawn(toProgram, toArgs, { env: { ...env, ...toExtra }, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
     from.stdout.pipe(to.stdin)
     // A reader that quits early shouldn't crash the main process with EPIPE.
     to.stdin.on('error', () => {})
@@ -104,19 +317,20 @@ export function pipe(req: PipeRequest): Promise<CommandResult> {
   })
 }
 
-/** The shell used for cluster setup steps. Steps are POSIX sh; on Windows prefer Git Bash. */
-function shellFor(commandLine: string): [string, string[]] {
-  if (!isWin) return ['/bin/sh', ['-c', commandLine]]
+/** The shell used for cluster setup steps. Steps are POSIX sh; on Windows prefer Git Bash, or WSL when the kubeconfig is there. */
+function shellFor(req: StreamRequest): [string, string[]] {
+  if (wsl) return [WSL_EXE, wslArgs(wsl.distro, wslCommandLine({ kubeconfig: wsl.linuxPaths, commandLine: req.commandLine, cwd: req.cwd, extra: req.env }))]
+  if (!isWin) return ['/bin/sh', ['-c', req.commandLine]]
   const bash = which('bash')
-  return bash ? [bash, ['-lc', commandLine]] : ['cmd.exe', ['/d', '/s', '/c', commandLine]]
+  return bash ? [bash, ['-lc', req.commandLine]] : ['cmd.exe', ['/d', '/s', '/c', req.commandLine]]
 }
 
 const streams = new Map<string, ChildProcess>()
 
 export function stream(req: StreamRequest, onLine: (line: string) => void, onExit: (status: number) => void) {
-  const [sh, args] = shellFor(req.commandLine)
+  const [sh, args] = shellFor(req)
   // Its own process group on unix, so cancel reaches the whole pipeline (make, go, kind…).
-  const child = spawn(sh, args, { cwd: req.cwd, env: { ...env, ...req.env }, windowsHide: true, detached: !isWin })
+  const child = spawn(sh, args, { cwd: wsl ? undefined : req.cwd, env: { ...env, ...req.env }, windowsHide: true, detached: !isWin })
   streams.set(req.id, child)
   // stdout and stderr share one buffer each so partial lines are never split.
   const buffers = { out: '', err: '' }
@@ -152,12 +366,19 @@ export function cancel(id: string) {
 /**
  * A kubeconfig that only sets current-context, prepended to KUBECONFIG, so
  * kubectl calls in the Makefile hit the chosen cluster without changing the
- * user's global context.
+ * user's global context. With a WSL kubeconfig the file is written into the
+ * distro's /tmp (through \\wsl.localhost) and Linux paths are returned.
  */
 export function kubeconfigFor(context: string): string {
-  const file = join(tmpdir(), `axstudio-kubeconfig-${context.replace(/[^\w.-]/g, '_')}.yaml`)
-  writeFileSync(file, `apiVersion: v1\nkind: Config\ncurrent-context: ${JSON.stringify(context)}\n`)
-  const base = process.env.KUBECONFIG || join(home, '.kube', 'config')
+  const name = `axstudio-kubeconfig-${context.replace(/[^\w.-]/g, '_')}.yaml`
+  const body = `apiVersion: v1\nkind: Config\ncurrent-context: ${JSON.stringify(context)}\n`
+  if (wsl) {
+    writeFileSync(wslUncPath(wsl.distro, `/tmp/${name}`), body)
+    return [`/tmp/${name}`, ...wsl.linuxPaths].join(':')
+  }
+  const file = join(tmpdir(), name)
+  writeFileSync(file, body)
+  const base = env.KUBECONFIG || join(home, '.kube', 'config')
   return [file, base].join(delimiter)
 }
 
@@ -169,7 +390,8 @@ export function kubeconfigFor(context: string): string {
 export function containerRuntime(shimDir: string): ContainerRuntime {
   if (which('docker')) return { runtime: 'docker', env: {} }
   if (!which('podman')) return { runtime: null, env: {} }
-  if (isWin) return { runtime: 'podman', env: { KIND_EXPERIMENTAL_PROVIDER: 'podman' } }
+  // Inside WSL the shim dir would be a Windows path; kind's podman provider is enough there.
+  if (isWin || wsl) return { runtime: 'podman', env: { KIND_EXPERIMENTAL_PROVIDER: 'podman' } }
   mkdirSync(shimDir, { recursive: true })
   const shim = join(shimDir, 'docker')
   writeFileSync(shim, DOCKER_SHIM)
@@ -178,14 +400,29 @@ export function containerRuntime(shimDir: string): ContainerRuntime {
 }
 
 const sessions = new Map<string, ChildProcess>()
+/** Sessions closed before their tunnel was ready; startSession then does not spawn. */
+const closedBeforeStart = new Set<string>()
 
 /**
  * Runs an interactive program with piped stdio. Output goes out as raw
  * chunks, since prompts don't end in a newline.
  */
-export function startSession(req: SessionRequest, onData: (data: string, stream: 'stdout' | 'stderr') => void, onExit: (status: number) => void) {
-  const program = which(req.program) ?? req.program
-  const child = spawn(program, req.args, { env: { ...env, TERM: 'dumb' }, windowsHide: true })
+export async function startSession(req: SessionRequest, onData: (data: string, stream: 'stdout' | 'stderr') => void, onExit: (status: number) => void) {
+  let extra: Record<string, string>
+  try {
+    extra = (await withAxServer(req.program, req.args, { TERM: 'dumb' })) ?? { TERM: 'dumb' }
+  } catch (e) {
+    onData((e as Error).message + '\n', 'stderr')
+    onExit(1)
+    return
+  }
+  // Closed while the tunnel was starting.
+  if (closedBeforeStart.delete(req.id)) {
+    onExit(130)
+    return
+  }
+  const [program, args] = command(req.program, req.args, { extra })
+  const child = spawn(program, args, { env: { ...env, ...extra }, windowsHide: true })
   sessions.set(req.id, child)
   child.stdout?.setEncoding('utf8').on('data', (d: string) => onData(d, 'stdout'))
   child.stderr?.setEncoding('utf8').on('data', (d: string) => onData(d, 'stderr'))
@@ -212,11 +449,18 @@ export function endSessionInput(id: string) {
 
 export function closeSession(id: string) {
   const child = sessions.get(id)
-  if (child && !child.killed) child.kill()
+  if (!child) closedBeforeStart.add(id)
+  else if (!child.killed) child.kill()
 }
 
 /** Streams run in their own process groups, so stop them when the app quits. */
 export function cancelAll() {
   for (const id of streams.keys()) cancel(id)
   for (const id of sessions.keys()) closeSession(id)
+  tunnels.stopAll()
+}
+
+/** Contexts with a live ax-server forward (for diagnostics). */
+export function activeTunnels(): string[] {
+  return tunnels.active()
 }

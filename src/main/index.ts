@@ -1,5 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, shell, type MenuItemConstructorOptions } from 'electron'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { delimiter, join } from 'node:path'
 import * as sh from './shell'
@@ -165,7 +165,22 @@ function registerIPC() {
   ipcMain.handle('session:close', (_e, id: string) => sh.closeSession(id))
   ipcMain.handle('which', (_e, program: string) => sh.which(program))
   ipcMain.handle('kubeconfigFor', (_e, context: string) => sh.kubeconfigFor(context))
-  ipcMain.handle('fileExists', (_e, path: string) => existsSync(expand(path)))
+  ipcMain.handle('kubeconfig:set', (_e, value: string) => sh.setKubeconfig(value))
+  ipcMain.handle('kubeconfig:info', () => sh.kubeconfigInfo())
+  ipcMain.handle('kubeconfig:pick', async (_e, current: string) => {
+    const first = current.split(delimiter)[0]?.trim()
+    const r = await dialog.showOpenDialog(win!, {
+      title: 'Choose kubeconfig file(s)',
+      defaultPath: first ? expand(first) : join(homedir(), '.kube'),
+      filters: [{ name: 'kubeconfig', extensions: ['yaml', 'yml', 'json', 'config', '*'] }, { name: 'All files', extensions: ['*'] }],
+      properties: ['openFile', 'multiSelections', 'showHiddenFiles'],
+    })
+    if (r.canceled || !r.filePaths.length) return null
+    return r.filePaths.join(delimiter)
+  })
+  ipcMain.handle('kubeconfig:sources', () => sh.kubeconfigSources())
+  ipcMain.handle('kubeconfig:find', (_e, sourceId: string) => sh.findKubeconfigs(sourceId))
+  ipcMain.handle('fileExists', (_e, path: string) => sh.pathExists(expand(path)))
   ipcMain.handle('containerRuntime', () => sh.containerRuntime(join(app.getPath('userData'), 'bin')))
   ipcMain.handle('openYAML', async (_e, defaultDir?: string) => {
     const r = await dialog.showOpenDialog(win!, {
